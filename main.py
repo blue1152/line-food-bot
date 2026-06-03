@@ -33,6 +33,7 @@ LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash")
+LINE_BOT_USER_ID = os.getenv("LINE_BOT_USER_ID")
 
 missing_envs = [
     name for name, value in {
@@ -63,6 +64,7 @@ group_location_cache = {}
 user_location_cache = {}
 processed_event_cache = {}
 event_cache_lock = threading.Lock()
+bot_user_id_lock = threading.Lock()
 LOCATION_CACHE_TTL_SECONDS = 2 * 60 * 60
 PROCESSED_EVENT_TTL_SECONDS = 10 * 60
 LOCATION_REQUIRED_MESSAGE = (
@@ -84,7 +86,7 @@ SEARCH_KEYWORDS = (
     "latest", "news", "event", "exhibition", "concert", "market", "construction", "schedule"
 )
 RECIPE_KEYWORDS = ("食譜", "做法", "怎麼做", "料理", "煮法", "recipe", "cook", "cooking", "how to make")
-BOT_KEYWORDS = ("吃什麼")
+BOT_KEYWORDS = ("@美食家", "吃什麼")
 
 # --- 3. 修正版角色設定（嚴格指定 Google 地圖 URL 格式） ---
 FOODIE_SYSTEM_INSTRUCTION = (
@@ -96,6 +98,7 @@ FOODIE_SYSTEM_INSTRUCTION = (
     "4. 若 grounding 資料不足、地點不明確，或無法確認店家仍在營業，請直接說明資料不足，寧可少推薦，也不要湊數。\n"
     "5. 不要宣稱你已查到即時營業狀態，除非 grounding 資料中明確支持。\n\n"
     "【回覆格式約束】：\n"
+    "0. 回覆使用者的時候，針對一般性回答，像個朋友，溫和而不帶侮辱字眼。只有針對美食/地點下評語時，才要毒舌。\n"
     "1. 前言必須極其簡短（嚴格限制在 30 字以內），直接切入主題，拒絕任何廢話。\n"
     "2. 使用點排列（Bullet points）呈現推薦店家。\n"
     "3. 每個推薦項目的結構必須嚴格遵守：\n"
@@ -208,6 +211,27 @@ def get_message_target_id(source) -> str | None:
         return source.user_id
     return get_conversation_id(source)
 
+def get_bot_user_id() -> str | None:
+    global LINE_BOT_USER_ID
+
+    if LINE_BOT_USER_ID:
+        return LINE_BOT_USER_ID
+
+    with bot_user_id_lock:
+        if LINE_BOT_USER_ID:
+            return LINE_BOT_USER_ID
+
+        try:
+            with ApiClient(configuration) as api_client:
+                line_bot_api = MessagingApi(api_client)
+                bot_info = line_bot_api.get_bot_info()
+                LINE_BOT_USER_ID = bot_info.user_id
+                logger.info("Fetched LINE bot user id.")
+                return LINE_BOT_USER_ID
+        except Exception:
+            logger.exception("Failed to fetch LINE bot user id.")
+            return None
+
 def get_grounding_kind(user_query: str) -> str | None:
     query = user_query.lower()
     if any(keyword.lower() in query for keyword in RECIPE_KEYWORDS):
@@ -221,7 +245,57 @@ def get_grounding_kind(user_query: str) -> str | None:
 def uses_grounding(user_query: str) -> bool:
     return get_grounding_kind(user_query) is not None
 
-def extract_group_prompt(user_message: str) -> tuple[bool, str]:
+def mention_to_dict(mention) -> dict | None:
+    if not mention:
+        return None
+
+    if isinstance(mention, dict):
+        return mention
+    if hasattr(mention, "to_dict"):
+        return mention.to_dict()
+    if hasattr(mention, "dict"):
+        return mention.dict()
+    if hasattr(mention, "model_dump"):
+        return mention.model_dump()
+    return None
+
+def extract_prompt_from_bot_mention(event: MessageEvent) -> tuple[bool, str]:
+    bot_user_id = get_bot_user_id()
+    if not bot_user_id:
+        return False, event.message.text.strip()
+
+    mention_data = mention_to_dict(getattr(event.message, "mention", None))
+    mentionees = mention_data.get("mentionees", []) if mention_data else []
+    bot_mentions = [
+        mentionee for mentionee in mentionees
+        if mentionee.get("userId") == bot_user_id or mentionee.get("user_id") == bot_user_id
+    ]
+    if not bot_mentions:
+        return False, event.message.text.strip()
+
+    clean_prompt = remove_mention_ranges(event.message.text, bot_mentions)
+    return True, clean_prompt.strip()
+
+def remove_mention_ranges(text: str, mentionees: list[dict]) -> str:
+    clean_text = text
+    ranges = []
+    for mentionee in mentionees:
+        index = mentionee.get("index")
+        length = mentionee.get("length")
+        if isinstance(index, int) and isinstance(length, int):
+            ranges.append((index, index + length))
+
+    for start, end in sorted(ranges, reverse=True):
+        clean_text = clean_text[:start] + clean_text[end:]
+
+    return clean_text
+
+def extract_group_prompt(user_message: str, event: MessageEvent | None = None) -> tuple[bool, str]:
+    if event:
+        is_mentioned, clean_prompt = extract_prompt_from_bot_mention(event)
+        if is_mentioned:
+            return True, clean_prompt
+
     for keyword in BOT_KEYWORDS:
         if keyword in user_message:
             return True, user_message.replace(keyword, "", 1).strip()
@@ -232,12 +306,7 @@ def log_mention_metadata(event: MessageEvent):
     if not mention:
         return
 
-    if hasattr(mention, "to_dict"):
-        mention_data = mention.to_dict()
-    elif hasattr(mention, "model_dump"):
-        mention_data = mention.model_dump()
-    else:
-        mention_data = repr(mention)
+    mention_data = mention_to_dict(mention) or repr(mention)
 
     logger.info("LINE mention metadata: %s", mention_data)
 
@@ -277,7 +346,7 @@ def handle_text_message(event: MessageEvent):
     target_id = get_message_target_id(event.source)
 
     if is_in_group:
-        is_triggered, clean_prompt = extract_group_prompt(user_message)
+        is_triggered, clean_prompt = extract_group_prompt(user_message, event)
         if not is_triggered:
             return 
         
