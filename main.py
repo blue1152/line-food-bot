@@ -31,12 +31,16 @@ app = FastAPI()
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash")
 
 missing_envs = [
     name for name, value in {
         "LINE_CHANNEL_SECRET": LINE_CHANNEL_SECRET,
         "LINE_CHANNEL_ACCESS_TOKEN": LINE_CHANNEL_ACCESS_TOKEN,
-        "GEMINI_API_KEY": GEMINI_API_KEY
+        "GEMINI_API_KEY": GEMINI_API_KEY,
+        "GEMINI_MODEL": GEMINI_MODEL,
+        "GEMINI_FALLBACK_MODEL": GEMINI_FALLBACK_MODEL
     }.items()
     if not value
 ]
@@ -80,7 +84,7 @@ SEARCH_KEYWORDS = (
     "latest", "news", "event", "exhibition", "concert", "market", "construction", "schedule"
 )
 RECIPE_KEYWORDS = ("食譜", "做法", "怎麼做", "料理", "煮法", "recipe", "cook", "cooking", "how to make")
-BOT_KEYWORDS = ("@美食家", "美食家", "@吃什麼", "吃什麼")
+BOT_KEYWORDS = ("吃什麼")
 
 # --- 3. 修正版角色設定（嚴格指定 Google 地圖 URL 格式） ---
 FOODIE_SYSTEM_INSTRUCTION = (
@@ -95,10 +99,10 @@ FOODIE_SYSTEM_INSTRUCTION = (
     "1. 前言必須極其簡短（嚴格限制在 30 字以內），直接切入主題，拒絕任何廢話。\n"
     "2. 使用點排列（Bullet points）呈現推薦店家。\n"
     "3. 每個推薦項目的結構必須嚴格遵守：\n"
-    "   * 店名/景點名\n"
-    "   * 【老饕碎碎念】：只能用一句話（20字內）精闢點出靈魂美味或特色，語氣要毒舌風趣。\n"
-    "   * 【Google 地圖】：必須嚴格、一字不差地使用此格式提供搜尋連結：https://www.google.com/maps/search/?api=1&query=店家名稱+地點（嚴禁將前綴修改為其他任何網址形式）。\n"
-    "   * 【刁嘴指數】：滿分5顆星（如：★★★★☆）。"
+    "店名/景點名\n"
+    "【評語】：只能用一句話（20字內）精闢點出靈魂美味或特色，語氣要毒舌風趣。\n"
+    "【Google 地圖】：必須嚴格、一字不差地使用此格式提供搜尋連結：https://www.google.com/maps/search/?api=1&query=店家名稱+地點（嚴禁將前綴修改為其他任何網址形式）。\n"
+    "【刁嘴指數】：滿分5顆星（如：★★★★☆）。"
 )
 
 # --- 4. Webhook 入口 ---
@@ -351,15 +355,44 @@ def ask_gemini_with_optional_wait(
 def ask_gemini_foodie(prompt: str, user_query: str, location: dict | None = None) -> str:
     try:
         config = build_gemini_config(user_query, location)
-        response = gemini_client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt,
-            config=config
-        )
+        response = generate_gemini_content(prompt, config, user_query)
         return format_gemini_response(response)
     except Exception:
         logger.exception("Gemini error.")
-        return "本美食家大腦低血糖打結中，等我吃口飯！"
+        return "查詢失敗，請再試一次。"
+
+def generate_gemini_content(prompt: str, config, user_query: str):
+    models = [GEMINI_MODEL]
+    if GEMINI_FALLBACK_MODEL != GEMINI_MODEL:
+        models.append(GEMINI_FALLBACK_MODEL)
+
+    last_error = None
+    for model in models:
+        try:
+            return gemini_client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=config
+            )
+        except Exception as e:
+            last_error = e
+            logger.warning("Gemini model failed. model=%s query=%s error=%s", model, user_query, e)
+
+    if config.tools:
+        logger.warning("Retrying Gemini without grounding tools. query=%s", user_query)
+        plain_config = build_plain_gemini_config()
+        for model in models:
+            try:
+                return gemini_client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config=plain_config
+                )
+            except Exception as e:
+                last_error = e
+                logger.warning("Gemini plain fallback failed. model=%s query=%s error=%s", model, user_query, e)
+
+    raise last_error
 
 def build_gemini_config(user_query: str, location: dict | None = None):
     grounding_kind = get_grounding_kind(user_query)
@@ -388,12 +421,19 @@ def build_gemini_config(user_query: str, location: dict | None = None):
         tool_config=tool_config
     )
 
+def build_plain_gemini_config():
+    return types.GenerateContentConfig(
+        system_instruction=FOODIE_SYSTEM_INSTRUCTION,
+        temperature=0.0,
+        max_output_tokens=3000
+    )
+
 def format_gemini_response(response) -> str:
     text = response.text or "本美食家突然失語，換個問法再來。"
     sources = collect_grounding_sources(response)
     if sources:
         text = f"{text}\n\n資料來源：\n" + "\n".join(sources)
-    return limit_line_text(text)
+    return text
 
 def collect_grounding_sources(response) -> list[str]:
     try:
@@ -427,10 +467,29 @@ def collect_grounding_sources(response) -> list[str]:
 
     return sources
 
-def limit_line_text(text: str, max_length: int = 4500) -> str:
+def split_line_text(text: str, max_length: int = 4500, max_messages: int = 5) -> list[str]:
     if len(text) <= max_length:
-        return text
-    return text[:max_length - 20].rstrip() + "\n...（回覆過長已截斷）"
+        return [text]
+
+    messages = []
+    remaining = text
+    while remaining and len(messages) < max_messages:
+        chunk = remaining[:max_length]
+        split_at = chunk.rfind("\n")
+        if split_at < max_length * 0.5:
+            split_at = max_length
+
+        messages.append(remaining[:split_at].rstrip())
+        remaining = remaining[split_at:].lstrip()
+
+    if remaining:
+        suffix = "\n...（內容過長，後續已省略）"
+        messages[-1] = (messages[-1][:max_length - len(suffix)].rstrip() + suffix)
+
+    return messages
+
+def build_text_messages(text: str) -> list[TextMessage]:
+    return [TextMessage(text=chunk) for chunk in split_line_text(text)]
 
 def send_line_reply(reply_token: str, text: str):
     with ApiClient(configuration) as api_client:
@@ -438,7 +497,7 @@ def send_line_reply(reply_token: str, text: str):
         line_bot_api.reply_message(
             ReplyMessageRequest(
                 reply_token=reply_token,
-                messages=[TextMessage(text=text)]
+                messages=build_text_messages(text)
             )
         )
 
@@ -465,6 +524,6 @@ def send_line_push(target_id: str, text: str):
         line_bot_api.push_message(
             PushMessageRequest(
                 to=target_id,
-                messages=[TextMessage(text=text)]
+                messages=build_text_messages(text)
             )
         )
