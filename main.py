@@ -383,7 +383,7 @@ def build_gemini_config(user_query: str, location: dict | None = None):
     return types.GenerateContentConfig(
         system_instruction=FOODIE_SYSTEM_INSTRUCTION,
         temperature=0.0,  # 降低隨機性，讓推薦更穩定並減少虛構
-        max_output_tokens=1200,
+        max_output_tokens=3000,
         tools=tools or None,
         tool_config=tool_config
     )
