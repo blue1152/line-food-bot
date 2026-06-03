@@ -87,6 +87,11 @@ SEARCH_KEYWORDS = (
 )
 RECIPE_KEYWORDS = ("食譜", "做法", "怎麼做", "料理", "煮法", "recipe", "cook", "cooking", "how to make")
 BOT_KEYWORDS = ("@美食家", "吃什麼")
+GENERIC_PLACE_QUERY_WORDS = (
+    "推薦", "找", "查", "有什麼", "哪裡", "哪家", "好吃", "好喝", "適合", "附近",
+    "幫我", "請問", "想吃", "想喝", "一下", "的", "和", "跟",
+    "recommend", "find", "search", "good", "best", "nearby", "near me"
+)
 
 # --- 3. 修正版角色設定（嚴格指定 Google 地圖 URL 格式） ---
 FOODIE_SYSTEM_INSTRUCTION = (
@@ -195,9 +200,27 @@ def get_cached_location(cache: dict, cache_key: str):
 
     return cached["location"]
 
+def clear_cached_location(cache: dict, cache_key: str | None):
+    if cache_key:
+        cache.pop(cache_key, None)
+
 def needs_location(user_query: str) -> bool:
     query = user_query.lower()
     return any(keyword.lower() in query for keyword in LOCATION_CONTEXT_KEYWORDS)
+
+def has_explicit_place_query(user_query: str) -> bool:
+    if get_grounding_kind(user_query) != "maps" or needs_location(user_query):
+        return False
+
+    query = user_query.lower()
+    for keyword in PLACE_QUERY_KEYWORDS + GENERIC_PLACE_QUERY_WORDS:
+        query = query.replace(keyword.lower(), "")
+
+    query = "".join(char for char in query if char.isalnum())
+    return len(query) >= 2
+
+def should_use_cached_location(user_query: str) -> bool:
+    return needs_location(user_query) or not has_explicit_place_query(user_query)
 
 def get_conversation_id(source) -> str | None:
     if isinstance(source, GroupSource):
@@ -352,6 +375,10 @@ def handle_text_message(event: MessageEvent):
         
         group_id = get_conversation_id(event.source)
         cached_location = get_cached_location(group_location_cache, group_id)
+        if cached_location and not should_use_cached_location(clean_prompt):
+            clear_cached_location(group_location_cache, group_id)
+            cached_location = None
+            logger.info("Cleared group location because query has explicit place. group_id=%s", group_id)
         
         if cached_location:
             final_prompt = (
@@ -367,7 +394,12 @@ def handle_text_message(event: MessageEvent):
                 return
             final_prompt = clean_prompt
     else:
-        cached_location = get_cached_location(user_location_cache, event.source.user_id) if isinstance(event.source, UserSource) else None
+        user_id = event.source.user_id if isinstance(event.source, UserSource) else None
+        cached_location = get_cached_location(user_location_cache, user_id) if user_id else None
+        if cached_location and not should_use_cached_location(user_message):
+            clear_cached_location(user_location_cache, user_id)
+            cached_location = None
+            logger.info("Cleared user location because query has explicit place. user_id=%s", user_id)
         
         if cached_location:
             final_prompt = (
