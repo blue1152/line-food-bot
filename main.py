@@ -75,6 +75,12 @@ LOCATION_REQUIRED_MESSAGE = (
 )
 AI_REPLY_TIMEOUT_SECONDS = 5
 AI_TOTAL_TIMEOUT_SECONDS = 45
+RENDER_SLEEP_NOTICE_MESSAGE = "休息中, 請稍等"
+RENDER_WAKE_RETRY_DELAY_SECONDS = 60
+RENDER_WAKE_DETECTION_WINDOW_SECONDS = int(os.getenv("RENDER_WAKE_DETECTION_WINDOW_SECONDS", "120"))
+SERVICE_STARTED_AT = time.time()
+render_wake_retry_scheduled = False
+render_wake_retry_lock = threading.Lock()
 
 LOCATION_CONTEXT_KEYWORDS = ("附近", "周邊", "這裡", "這附近", "周圍", "nearby", "near me", "around me")
 RELATIVE_LOCATION_VALUES = LOCATION_CONTEXT_KEYWORDS + ("here", "current location", "my location")
@@ -442,6 +448,29 @@ def log_mention_metadata(event: MessageEvent):
     logger.info("LINE mention metadata: %s", mention_data)
 
 # --- 5. 處理「位置」訊息事件 (只紀錄，不回應) ---
+def should_delay_for_render_wake() -> bool:
+    if time.time() - SERVICE_STARTED_AT > RENDER_WAKE_DETECTION_WINDOW_SECONDS:
+        return False
+
+    global render_wake_retry_scheduled
+    with render_wake_retry_lock:
+        if render_wake_retry_scheduled:
+            return False
+        render_wake_retry_scheduled = True
+        return True
+
+def retry_text_message_after_render_wake(event: MessageEvent):
+    try:
+        logger.info("Retrying text message after Render wake delay.")
+        handle_text_message(event, skip_duplicate_check=False)
+    except Exception:
+        logger.exception("Failed to retry text message after Render wake delay.")
+
+def schedule_render_wake_retry(event: MessageEvent):
+    timer = threading.Timer(RENDER_WAKE_RETRY_DELAY_SECONDS, retry_text_message_after_render_wake, args=(event,))
+    timer.daemon = True
+    timer.start()
+
 @handler.add(MessageEvent, message=LocationMessageContent)
 def handle_location_message(event: MessageEvent):
     if should_skip_event(event):
@@ -465,8 +494,8 @@ def handle_location_message(event: MessageEvent):
 
 # --- 6. 處理「文字」訊息事件 (被 Tag 時觸發) ---
 @handler.add(MessageEvent, message=TextMessageContent)
-def handle_text_message(event: MessageEvent):
-    if should_skip_event(event):
+def handle_text_message(event: MessageEvent, skip_duplicate_check: bool = True):
+    if skip_duplicate_check and should_skip_event(event):
         return
 
     user_message = event.message.text
@@ -480,6 +509,11 @@ def handle_text_message(event: MessageEvent):
         is_triggered, clean_prompt = extract_group_prompt(user_message, event)
         if not is_triggered:
             return 
+
+        if should_delay_for_render_wake():
+            send_line_reply_or_push(reply_token, RENDER_SLEEP_NOTICE_MESSAGE, target_id)
+            schedule_render_wake_retry(event)
+            return
         
         group_id = get_conversation_id(event.source)
         cached_location = get_cached_location(group_location_cache, group_id)
@@ -497,6 +531,11 @@ def handle_text_message(event: MessageEvent):
                 return
             final_prompt = build_prompt_with_detected_locations(clean_prompt, location_detection)
     else:
+        if should_delay_for_render_wake():
+            send_line_reply_or_push(reply_token, RENDER_SLEEP_NOTICE_MESSAGE, target_id)
+            schedule_render_wake_retry(event)
+            return
+
         user_id = event.source.user_id if isinstance(event.source, UserSource) else None
         cached_location = get_cached_location(user_location_cache, user_id) if user_id else None
         location_detection = detect_locations_in_text(user_message)
