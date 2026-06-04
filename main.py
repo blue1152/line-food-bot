@@ -5,9 +5,6 @@ import re
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
-from urllib.error import HTTPError, URLError
-from urllib.parse import quote_plus, urlencode
-from urllib.request import Request as UrlRequest, urlopen
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
@@ -38,9 +35,6 @@ LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
 GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash")
-GEMINI_MAPS_MODEL = os.getenv("GEMINI_MAPS_MODEL") or GEMINI_MODEL
-GEMINI_MAPS_FALLBACK_MODEL = os.getenv("GEMINI_MAPS_FALLBACK_MODEL") or GEMINI_FALLBACK_MODEL
-MAPS_TOOLS_API_KEY = os.getenv("MAPS_GROUNDING_API_KEY") or os.getenv("GOOGLE_MAPS_API_KEY") or GEMINI_API_KEY
 LINE_BOT_USER_ID = os.getenv("LINE_BOT_USER_ID")
 
 missing_envs = [
@@ -49,9 +43,7 @@ missing_envs = [
         "LINE_CHANNEL_ACCESS_TOKEN": LINE_CHANNEL_ACCESS_TOKEN,
         "GEMINI_API_KEY": GEMINI_API_KEY,
         "GEMINI_MODEL": GEMINI_MODEL,
-        "GEMINI_FALLBACK_MODEL": GEMINI_FALLBACK_MODEL,
-        "GEMINI_MAPS_MODEL": GEMINI_MAPS_MODEL,
-        "GEMINI_MAPS_FALLBACK_MODEL": GEMINI_MAPS_FALLBACK_MODEL
+        "GEMINI_FALLBACK_MODEL": GEMINI_FALLBACK_MODEL
     }.items()
     if not value
 ]
@@ -76,10 +68,8 @@ class GroundingUnavailableError(Exception):
 group_location_cache = {}
 user_location_cache = {}
 processed_event_cache = {}
-resolved_place_id_cache = {}
 event_cache_lock = threading.Lock()
 bot_user_id_lock = threading.Lock()
-resolution_cache_lock = threading.Lock()
 LOCATION_CACHE_TTL_SECONDS = 2 * 60 * 60
 PROCESSED_EVENT_TTL_SECONDS = 10 * 60
 LOCATION_REQUIRED_MESSAGE = (
@@ -115,30 +105,17 @@ GENERIC_PLACE_QUERY_WORDS = (
     "recommend", "find", "search", "good", "best", "nearby", "near me"
 )
 
-# --- 3. 修正版角色設定（依 grounding 類型指定來源格式） ---
+# --- 3. 角色設定（交由 Google Search Grounding 產生官方來源標註） ---
 FOODIE_SYSTEM_INSTRUCTION = (
     "你是一位兼具旅遊專家、城市探險家與頂級美食家的嚮導；你熟悉景點、活動、路線、在地文化與臨場探索，但美食判斷是你的最強項，說話風趣刁鑽。\n\n"
-    "【重要時空與真實性限制】：\n"
-    "1. 若系統提供 Google Maps 或 Google Search grounding 資料，請優先依據 grounding 資料回答。\n"
-    "2. 嚴格禁止虛構、捏造、想像任何不存在的店家、景點或活動名稱。\n"
-    "3. 推薦店家或景點時，必須以可從 grounding 資料、使用者提供的位置、或明確地名合理查證的真實地點為準。\n"
-    "4. 若 grounding 資料不足、地點不明確，或無法確認店家仍在營業，請直接說明資料不足，寧可少推薦，也不要湊數。\n"
-    "5. 不要宣稱你已查到即時營業狀態，除非 grounding 資料中明確支持。\n\n"
-    "【回覆格式約束】：\n"
-    "0. 回覆使用者的時候，針對一般性回答，像個朋友，溫和而不帶侮辱字眼。只有針對美食/地點下評語時，才要毒舌。\n"
-    "1. 前言必須極其簡短（嚴格限制在 30 字以內），直接切入主題，拒絕任何廢話。\n"
-    "2. 使用點排列（Bullet points）呈現推薦項目；在 grounding 資料充足時，請盡量多給結果，優先提供 8 到 12 個真實可查證項目，不要只給 3 到 5 個。\n"
-    "2-1. 每個推薦項目之間必須空一行，方便系統分段傳送；同一個項目的店名、評語、連結和指數必須放在同一段。\n"
-    "3. 如果推薦的是店名、餐廳、景點或明確地點，每個推薦項目的結構必須嚴格遵守：\n"
-    "店名/景點名\n"
-    "【評語】：只能用一句話（20字內）精闢點出靈魂美味或特色，語氣要毒舌風趣。\n"
-    "【Google 地圖】：請讓系統自動為每家店生成對應的 Google 搜尋聯網腳註標記（Attribution Sources）。\n"
-    "【推薦指數】：滿分5顆星（如：★★★★☆）。\n"
-    "4. 如果推薦的是活動、展覽、演唱會、市集、新聞、施工、營業異動、票價或時間表等 Google Search 查到的結果，嚴禁提供 Google 地圖連結，改用此格式：\n"
-    "活動/結果名稱\n"
-    "【評語】：只能用一句話（20字內）點出重點，語氣可犀利但不要侮辱。\n"
-    "【資料來源】：必須使用 Google Search grounding 查到的原始網址。\n"
-    "【推薦指數】：滿分5顆星（如：★★★★☆）。"
+    "【重要限制】：\n"
+    "1. 你必須搭配內建的 Google Search 聯網工具（Grounding）來驗證店家、景點、活動與時效資訊，絕對不允許虛構。\n"
+    "2. 永久歇業、無法查證、或 grounding 資料不足的店家一律不准推薦。\n"
+    "3. 前言必須極其簡短（30字內），直接切入主題。\n"
+    "4. 每個推薦項目請給出：名稱、一句老饕碎碎念（20字內，毒舌風趣但不要侮辱）、推薦指數。\n"
+    "5. 在 grounding 資料充足時，請盡量多給結果，優先提供 8 到 12 個真實可查證項目。\n"
+    "6. 每個推薦項目之間必須空一行，方便系統分段傳送；同一個項目的名稱、評語和推薦指數必須放在同一段。\n"
+    "7. 請讓系統自動為每個項目生成 Google Search Grounding 的腳註標記；不要自行輸出任何手寫 URL 或來源區塊。"
 )
 
 LOCATION_DETECTION_SYSTEM_INSTRUCTION = (
@@ -327,6 +304,18 @@ def build_prompt_with_detected_locations(user_query: str, location_detection: di
         "請優先以這些地點資訊作為查詢與回答依據。"
     )
 
+def build_prompt_with_cached_location(user_query: str, location: dict, chat_context: str) -> str:
+    return (
+        f"使用者在{chat_context}詢問：『{user_query}』\n"
+        "請使用 Google Search 聯網工具，以以下精準經緯度座標為中心，"
+        "搜尋周邊半徑 1 公里內符合使用者需求的真實店家、景點或活動。\n"
+        f"【使用者需求】：{user_query}\n"
+        f"【中心點名稱】：{location['title']}\n"
+        f"【中心點地址】：{location['address']}\n"
+        f"【精準座標】：緯度 {location['latitude']}, 經度 {location['longitude']}\n\n"
+        "請務必以 Google Search grounding 查到的資料為準，優先排除明顯歇業、永久停業或資料不足的結果。"
+    )
+
 def needs_location(user_query: str) -> bool:
     query = user_query.lower()
     return any(keyword.lower() in query for keyword in LOCATION_CONTEXT_KEYWORDS)
@@ -491,13 +480,7 @@ def handle_text_message(event: MessageEvent):
             logger.info("Cleared group location because query has explicit place. group_id=%s", group_id)
         
         if cached_location:
-            final_prompt = (
-                f"使用者在群組中標記了你，並詢問：『{clean_prompt}』\n"
-                f"請結合該群組最後提供的定位資訊與周邊進行回答：\n"
-                f"定位名稱: {cached_location['title']}\n"
-                f"地址: {cached_location['address']}\n"
-                f"座標: 緯度 {cached_location['latitude']}, 經度 {cached_location['longitude']}"
-            )
+            final_prompt = build_prompt_with_cached_location(clean_prompt, cached_location, "群組中標記了你，並")
         else:
             if not has_detected_location(location_detection):
                 send_line_reply_or_push(reply_token, LOCATION_REQUIRED_MESSAGE, target_id)
@@ -513,13 +496,7 @@ def handle_text_message(event: MessageEvent):
             logger.info("Cleared user location because query has explicit place. user_id=%s", user_id)
         
         if cached_location:
-            final_prompt = (
-                f"使用者在一對一聊天室詢問：『{user_message}』\n"
-                f"請結合使用者最後提供的定位資訊與周邊進行回答：\n"
-                f"定位名稱: {cached_location['title']}\n"
-                f"地址: {cached_location['address']}\n"
-                f"座標: 緯度 {cached_location['latitude']}, 經度 {cached_location['longitude']}"
-            )
+            final_prompt = build_prompt_with_cached_location(user_message, cached_location, "一對一聊天室")
         else:
             if not has_detected_location(location_detection):
                 send_line_reply_or_push(reply_token, LOCATION_REQUIRED_MESSAGE, target_id)
@@ -589,7 +566,13 @@ def generate_gemini_content(prompt: str, config, user_query: str):
                 config=config
             )
             if grounding_kind and config.tools and not has_grounding_chunks(response, grounding_kind):
-                logger.warning("Gemini response missing grounding chunks. model=%s kind=%s query=%s", model, grounding_kind, user_query)
+                logger.warning(
+                    "Gemini response missing expected grounding chunks. model=%s kind=%s query=%s chunk_types=%s",
+                    model,
+                    grounding_kind,
+                    user_query,
+                    get_grounding_chunk_types(response)
+                )
                 continue
             return response
         except Exception as e:
@@ -602,8 +585,6 @@ def generate_gemini_content(prompt: str, config, user_query: str):
     raise last_error
 
 def get_candidate_models(grounding_kind: str | None) -> list[str]:
-    if grounding_kind == "maps":
-        return unique_models([GEMINI_MAPS_MODEL, GEMINI_MAPS_FALLBACK_MODEL])
     return unique_models([GEMINI_MODEL, GEMINI_FALLBACK_MODEL])
 
 def unique_models(models: list[str]) -> list[str]:
@@ -623,38 +604,39 @@ def has_grounding_chunks(response, grounding_kind: str) -> bool:
         return False
 
     for chunk in chunks:
-        if grounding_kind == "maps" and getattr(chunk, "maps", None):
-            return True
-        if grounding_kind == "search" and getattr(chunk, "web", None):
+        if getattr(chunk, "web", None) or getattr(chunk, "maps", None):
             return True
 
     return False
 
+def get_grounding_chunk_types(response) -> list[str]:
+    try:
+        chunks = response.candidates[0].grounding_metadata.grounding_chunks
+    except (AttributeError, IndexError, TypeError):
+        return []
+
+    chunk_types = []
+    for chunk in chunks or []:
+        for chunk_type in ("web", "maps", "retrieved_context"):
+            if getattr(chunk, chunk_type, None):
+                chunk_types.append(chunk_type)
+    return chunk_types
+
 def build_gemini_config(user_query: str, location: dict | None = None):
     grounding_kind = get_grounding_kind(user_query)
     tools = []
-    tool_config = None
 
     if grounding_kind == "search":
         tools.append(build_google_search_tool())
     elif grounding_kind == "maps":
         tools.append(build_google_search_tool())
-        if location:
-            tool_config = types.ToolConfig(
-                retrieval_config=types.RetrievalConfig(
-                    lat_lng=types.LatLng(
-                        latitude=location["latitude"],
-                        longitude=location["longitude"]
-                    )
-                )
-            )
 
     return types.GenerateContentConfig(
         system_instruction=FOODIE_SYSTEM_INSTRUCTION,
         temperature=0.0,  # 降低隨機性，讓推薦更穩定並減少虛構
         max_output_tokens=6000,
-        tools=tools or None,
-        tool_config=tool_config
+        safety_settings=build_safety_settings(),
+        tools=tools or None
     )
 
 def build_google_search_tool():
@@ -666,88 +648,25 @@ def build_plain_gemini_config():
     return types.GenerateContentConfig(
         system_instruction=FOODIE_SYSTEM_INSTRUCTION,
         temperature=0.0,
-        max_output_tokens=6000
+        max_output_tokens=6000,
+        safety_settings=build_safety_settings()
     )
+
+def build_safety_settings():
+    return [
+        types.SafetySetting(
+            category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+            threshold=types.HarmBlockThreshold.BLOCK_NONE,
+        )
+    ]
 
 def format_gemini_response(response, user_query: str) -> str:
     text = response.text or "本美食家突然失語，換個問法再來。"
     grounding_kind = get_grounding_kind(user_query)
-    if grounding_kind == "search":
-        text = remove_google_maps_lines(text)
-    elif grounding_kind == "maps":
-        text = replace_google_maps_lines(text, build_grounded_maps_urls(response))
-
     sources = collect_grounding_sources(response, grounding_kind)
     if sources:
-        text = f"{text}\n\n資料來源：\n" + "\n".join(sources)
+        text = f"{text}\n\n【老饕附上真實來源】\n" + "\n".join(sources)
     return text
-
-def remove_google_maps_lines(text: str) -> str:
-    lines = [
-        line for line in text.splitlines()
-        if "【Google 地圖】" not in line and "【Google Maps】" not in line
-    ]
-    return "\n".join(lines).strip()
-
-def replace_google_maps_lines(text: str, maps_urls: list[str]) -> str:
-    if not maps_urls:
-        return remove_google_maps_lines(text)
-
-    url_index = 0
-    lines = []
-    for line in text.splitlines():
-        if "【Google 地圖】" not in line and "【Google Maps】" not in line:
-            lines.append(line)
-            continue
-
-        maps_url = maps_urls[min(url_index, len(maps_urls) - 1)]
-        prefix = line[:len(line) - len(line.lstrip())]
-        lines.append(f"{prefix}【Google 地圖】：{maps_url}")
-        url_index += 1
-
-    return "\n".join(lines).strip()
-
-def build_grounded_maps_urls(response) -> list[str]:
-    try:
-        grounding = response.candidates[0].grounding_metadata
-    except (AttributeError, IndexError, TypeError):
-        return []
-
-    if not grounding or not grounding.grounding_chunks:
-        return []
-
-    maps_urls = []
-    seen = set()
-    for chunk in grounding.grounding_chunks:
-        maps_data = getattr(chunk, "maps", None)
-        if not maps_data:
-            continue
-
-        maps_url = build_grounded_maps_url(maps_data)
-        if not maps_url or maps_url in seen:
-            continue
-
-        seen.add(maps_url)
-        maps_urls.append(maps_url)
-
-    return maps_urls
-
-def build_grounded_maps_url(maps_data) -> str | None:
-    title = get_maps_title(maps_data)
-    official_url = get_official_maps_url(maps_data)
-    place_id = get_maps_place_id(maps_data)
-    if not place_id and official_url:
-        place_id = resolve_place_id_by_maps_url(official_url)
-    if not place_id and title:
-        place_id = resolve_place_id_by_name(title)
-    if place_id and title:
-        return (
-            "https://www.google.com/maps/search/?api=1"
-            f"&query={quote_plus(title)}"
-            f"&query_place_id={quote_plus(place_id)}"
-        )
-
-    return official_url
 
 def get_official_maps_url(maps_data) -> str | None:
     for attr_name in ("google_maps_uri", "googleMapsUri", "place_url", "placeUrl"):
@@ -769,112 +688,6 @@ def get_official_maps_url(maps_data) -> str | None:
 
     return getattr(maps_data, "uri", None)
 
-def get_maps_title(maps_data) -> str | None:
-    return getattr(maps_data, "title", None) or getattr(maps_data, "text", None)
-
-def get_maps_place_id(maps_data) -> str | None:
-    place_id = (
-        getattr(maps_data, "place_id", None)
-        or getattr(maps_data, "placeId", None)
-        or getattr(maps_data, "id", None)
-    )
-    if not place_id:
-        return None
-
-    return normalize_place_id(str(place_id))
-
-def normalize_place_id(place_id: str) -> str:
-    return place_id.removeprefix("places/")
-
-def resolve_place_id_by_name(place_name: str) -> str | None:
-    if not MAPS_TOOLS_API_KEY:
-        return None
-
-    normalized_name = place_name.strip().lower()
-    if not normalized_name:
-        return None
-    cache_key = f"name:{normalized_name}"
-
-    with resolution_cache_lock:
-        if cache_key in resolved_place_id_cache:
-            return resolved_place_id_cache[cache_key]
-
-    try:
-        response_data = call_resolve_names_api(place_name)
-        result = (response_data.get("results") or [{}])[0]
-        entity = result.get("entity") or {}
-        place_id = entity.get("place")
-        if not place_id:
-            failed_requests = response_data.get("failedRequests") or {}
-            if failed_requests:
-                logger.info("Maps ResolveNames failed. place=%s detail=%s", place_name, failed_requests.get("0"))
-            return None
-
-        normalized_place_id = normalize_place_id(place_id)
-        with resolution_cache_lock:
-            resolved_place_id_cache[cache_key] = normalized_place_id
-        return normalized_place_id
-    except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError):
-        logger.exception("Maps ResolveNames request failed. place=%s", place_name)
-        return None
-
-def resolve_place_id_by_maps_url(maps_url: str) -> str | None:
-    if not MAPS_TOOLS_API_KEY:
-        return None
-
-    normalized_url = maps_url.strip()
-    if not normalized_url:
-        return None
-    cache_key = f"url:{normalized_url}"
-
-    with resolution_cache_lock:
-        if cache_key in resolved_place_id_cache:
-            return resolved_place_id_cache[cache_key]
-
-    try:
-        response_data = call_resolve_maps_urls_api(maps_url)
-        entity = (response_data.get("entities") or [{}])[0]
-        place_id = entity.get("place")
-        if not place_id:
-            failed_requests = response_data.get("failedRequests") or {}
-            if failed_requests:
-                logger.info("Maps ResolveMapsUrls failed. url=%s detail=%s", maps_url, failed_requests.get("0"))
-            return None
-
-        normalized_place_id = normalize_place_id(place_id)
-        with resolution_cache_lock:
-            resolved_place_id_cache[cache_key] = normalized_place_id
-        return normalized_place_id
-    except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError):
-        logger.exception("Maps ResolveMapsUrls request failed. url=%s", maps_url)
-        return None
-
-def call_resolve_names_api(place_name: str) -> dict:
-    endpoint = "https://mapstools.googleapis.com/v1alpha:resolveNames"
-    url = f"{endpoint}?{urlencode({'key': MAPS_TOOLS_API_KEY})}"
-    payload = json.dumps({"queries": [{"text": place_name}]}).encode("utf-8")
-    request = UrlRequest(
-        url,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST"
-    )
-    with urlopen(request, timeout=5) as response:
-        return json.loads(response.read().decode("utf-8"))
-
-def call_resolve_maps_urls_api(maps_url: str) -> dict:
-    endpoint = "https://mapstools.googleapis.com/v1alpha:resolveMapsUrls"
-    url = f"{endpoint}?{urlencode({'key': MAPS_TOOLS_API_KEY})}"
-    payload = json.dumps({"urls": [maps_url]}).encode("utf-8")
-    request = UrlRequest(
-        url,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST"
-    )
-    with urlopen(request, timeout=5) as response:
-        return json.loads(response.read().decode("utf-8"))
-
 def collect_grounding_sources(response, grounding_kind: str | None = None) -> list[str]:
     try:
         grounding = response.candidates[0].grounding_metadata
@@ -889,9 +702,7 @@ def collect_grounding_sources(response, grounding_kind: str | None = None) -> li
     for chunk in grounding.grounding_chunks:
         source = None
         if getattr(chunk, "maps", None):
-            if grounding_kind == "search":
-                continue
-            source = ("Google Maps", chunk.maps.title, build_grounded_maps_url(chunk.maps))
+            source = ("Google Maps", chunk.maps.title, get_official_maps_url(chunk.maps))
         elif getattr(chunk, "web", None):
             source = ("Web", chunk.web.title, chunk.web.uri)
 
@@ -903,8 +714,8 @@ def collect_grounding_sources(response, grounding_kind: str | None = None) -> li
             continue
 
         seen.add(uri)
-        sources.append(f"- {label}：{title} {uri}")
-        if len(sources) >= 5:
+        sources.append(f"- {title}: {uri}")
+        if len(sources) >= 12:
             break
 
     return sources
