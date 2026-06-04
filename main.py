@@ -105,17 +105,22 @@ GENERIC_PLACE_QUERY_WORDS = (
     "recommend", "find", "search", "good", "best", "nearby", "near me"
 )
 
-# --- 3. 角色設定（交由 Google Search Grounding 產生官方來源標註） ---
+# --- 3. 系統角色設定（由模型依真實店名生成標準 Google 地圖搜尋連結） ---
 FOODIE_SYSTEM_INSTRUCTION = (
     "你是一位兼具旅遊專家、城市探險家與頂級美食家的嚮導；你熟悉景點、活動、路線、在地文化與臨場探索，但美食判斷是你的最強項，說話風趣刁鑽。\n\n"
     "【重要限制】：\n"
     "1. 你必須搭配內建的 Google Search 聯網工具（Grounding）來驗證店家、景點、活動與時效資訊，絕對不允許虛構。\n"
     "2. 永久歇業、無法查證、或 grounding 資料不足的店家一律不准推薦。\n"
-    "3. 前言必須極其簡短（30字內），直接切入主題。\n"
-    "4. 每個推薦項目請給出：名稱、一句老饕碎碎念（20字內，毒舌風趣但不要侮辱）、推薦指數。\n"
-    "5. 在 grounding 資料充足時，請盡量多給結果，優先提供 8 到 12 個真實可查證項目。\n"
-    "6. 每個推薦項目之間必須空一行，方便系統分段傳送；同一個項目的名稱、評語和推薦指數必須放在同一段。\n"
-    "7. 請讓系統自動為每個項目生成 Google Search Grounding 的腳註標記；不要自行輸出任何手寫 URL 或來源區塊。"
+    "3. 前言必須極其簡短（嚴格限制在 30 字以內），直接切入主題。\n"
+    "4. 在 grounding 資料充足時，請盡量多給結果，優先提供 8 到 12 個真實可查證項目。\n\n"
+    "【回覆格式約束】：\n"
+    "1. 使用點排列（Bullet points）呈現推薦項目。\n"
+    "2. 每個推薦項目之間必須空一行，方便系統分段傳送；同一個項目的名稱、碎碎念、地圖連結和指數必須放在同一段。\n"
+    "3. 每個推薦項目的結構必須嚴格遵守：\n"
+    "   * 店名/景點名/活動名\n"
+    "   * 【評語】：只能用一句話（20字內）精闢點出特色，語氣要毒舌風趣但不要侮辱。\n"
+    "   * 【Google 地圖】：請依據你聯網查到的真實名稱與區域，將其 URL 編碼並嚴格以下列格式自行生成標準地圖搜尋連結：https://www.google.com/maps/search/?api=1&query=店名+區域（例如：https://www.google.com/maps/search/?api=1&query=綠河+新店）。\n"
+    "   * 【推薦指數】：滿分5顆星（如：★★★★☆）。"
 )
 
 LOCATION_DETECTION_SYSTEM_INSTRUCTION = (
@@ -543,9 +548,10 @@ def ask_gemini_with_optional_wait(
 
 def ask_gemini_foodie(prompt: str, user_query: str, location: dict | None = None) -> str:
     try:
+        logger.info("Sending Gemini Grounding request. query=%s", user_query)
         config = build_gemini_config(user_query, location)
         response = generate_gemini_content(prompt, config, user_query)
-        return format_gemini_response(response, user_query)
+        return response.text or "本美食家連網查了老半天突然失語，換個方式問問看？"
     except GroundingUnavailableError:
         logger.exception("Grounding unavailable.")
         return "查不到可驗證的 Google 來源，請換個更明確的地點或查詢再試一次。"
@@ -657,68 +663,12 @@ def build_safety_settings():
         types.SafetySetting(
             category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
             threshold=types.HarmBlockThreshold.BLOCK_NONE,
-        )
+        ),
+        types.SafetySetting(
+            category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+            threshold=types.HarmBlockThreshold.BLOCK_NONE,
+        ),
     ]
-
-def format_gemini_response(response, user_query: str) -> str:
-    text = response.text or "本美食家突然失語，換個問法再來。"
-    grounding_kind = get_grounding_kind(user_query)
-    sources = collect_grounding_sources(response, grounding_kind)
-    if sources:
-        text = f"{text}\n\n【老饕附上真實來源】\n" + "\n".join(sources)
-    return text
-
-def get_official_maps_url(maps_data) -> str | None:
-    for attr_name in ("google_maps_uri", "googleMapsUri", "place_url", "placeUrl"):
-        official_url = getattr(maps_data, attr_name, None)
-        if official_url:
-            return official_url
-
-    maps_links = (
-        getattr(maps_data, "google_maps_links", None)
-        or getattr(maps_data, "googleMapsLinks", None)
-    )
-    if isinstance(maps_links, dict):
-        return maps_links.get("placeUrl") or maps_links.get("place_url")
-    if maps_links:
-        return (
-            getattr(maps_links, "place_url", None)
-            or getattr(maps_links, "placeUrl", None)
-        )
-
-    return getattr(maps_data, "uri", None)
-
-def collect_grounding_sources(response, grounding_kind: str | None = None) -> list[str]:
-    try:
-        grounding = response.candidates[0].grounding_metadata
-    except (AttributeError, IndexError, TypeError):
-        return []
-
-    if not grounding or not grounding.grounding_chunks:
-        return []
-
-    sources = []
-    seen = set()
-    for chunk in grounding.grounding_chunks:
-        source = None
-        if getattr(chunk, "maps", None):
-            source = ("Google Maps", chunk.maps.title, get_official_maps_url(chunk.maps))
-        elif getattr(chunk, "web", None):
-            source = ("Web", chunk.web.title, chunk.web.uri)
-
-        if not source:
-            continue
-
-        label, title, uri = source
-        if not title or not uri or uri in seen:
-            continue
-
-        seen.add(uri)
-        sources.append(f"- {title}: {uri}")
-        if len(sources) >= 12:
-            break
-
-    return sources
 
 TRUNCATED_MESSAGE_SUFFIX = "\n...（內容過長，後續已省略）"
 
@@ -781,7 +731,8 @@ def is_plain_item_title_line(line: str, next_line: str) -> bool:
     stripped_line = line.strip()
     if not stripped_line or stripped_line.startswith("【"):
         return False
-    return next_line.strip().startswith("【評語】")
+    stripped_next_line = next_line.strip()
+    return stripped_next_line.startswith("【評語】")
 
 def is_source_section_start(line: str) -> bool:
     return line.strip() in ("資料來源：", "資料來源:")
