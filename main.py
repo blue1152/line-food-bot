@@ -38,6 +38,8 @@ LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
 GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash")
+GEMINI_MAPS_MODEL = os.getenv("GEMINI_MAPS_MODEL") or GEMINI_MODEL
+GEMINI_MAPS_FALLBACK_MODEL = os.getenv("GEMINI_MAPS_FALLBACK_MODEL") or GEMINI_FALLBACK_MODEL
 MAPS_TOOLS_API_KEY = os.getenv("MAPS_GROUNDING_API_KEY") or os.getenv("GOOGLE_MAPS_API_KEY") or GEMINI_API_KEY
 LINE_BOT_USER_ID = os.getenv("LINE_BOT_USER_ID")
 
@@ -47,7 +49,9 @@ missing_envs = [
         "LINE_CHANNEL_ACCESS_TOKEN": LINE_CHANNEL_ACCESS_TOKEN,
         "GEMINI_API_KEY": GEMINI_API_KEY,
         "GEMINI_MODEL": GEMINI_MODEL,
-        "GEMINI_FALLBACK_MODEL": GEMINI_FALLBACK_MODEL
+        "GEMINI_FALLBACK_MODEL": GEMINI_FALLBACK_MODEL,
+        "GEMINI_MAPS_MODEL": GEMINI_MAPS_MODEL,
+        "GEMINI_MAPS_FALLBACK_MODEL": GEMINI_MAPS_FALLBACK_MODEL
     }.items()
     if not value
 ]
@@ -64,6 +68,9 @@ gemini_client = genai.Client(
     )
 )
 gemini_executor = ThreadPoolExecutor(max_workers=4)
+
+class GroundingUnavailableError(Exception):
+    pass
 
 # --- 2. 記憶庫：暫存最後發送的位置資訊 ---
 group_location_cache = {}
@@ -100,7 +107,6 @@ SEARCH_KEYWORDS = (
     "最新", "活動", "展覽", "演唱會", "市集", "施工", "營業異動", "臨時休息", "新聞", "票價", "時間表",
     "latest", "news", "event", "exhibition", "concert", "market", "construction", "schedule"
 )
-RECIPE_KEYWORDS = ("食譜", "做法", "怎麼做", "料理", "煮法", "recipe", "cook", "cooking", "how to make")
 BOT_KEYWORDS = ("@美食家", "吃什麼")
 GENERIC_PLACE_QUERY_WORDS = (
     "推薦", "找", "查", "有什麼", "哪裡", "哪家", "好吃", "好喝", "適合", "附近",
@@ -125,7 +131,7 @@ FOODIE_SYSTEM_INSTRUCTION = (
     "3. 如果推薦的是店名、餐廳、景點或明確地點，每個推薦項目的結構必須嚴格遵守：\n"
     "店名/景點名\n"
     "【評語】：只能用一句話（20字內）精闢點出靈魂美味或特色，語氣要毒舌風趣。\n"
-    "【Google 地圖】：必須使用 Google Maps grounding 回傳的 place_id 或 Resolution API 解析出的 Place ID 產生精準連結，格式為 https://www.google.com/maps/search/?api=1&query=URL編碼店名&query_place_id=PLACE_ID；如果 Grounding Lite 已提供 places.googleMapsLinks.placeUrl，才可直接使用該官方連結；嚴禁只用店名關鍵字搜尋。\n"
+    "【Google 地圖】：請讓系統自動為每家店生成對應的 Google 搜尋聯網腳註標記（Attribution Sources）。\n"
     "【推薦指數】：滿分5顆星（如：★★★★☆）。\n"
     "4. 如果推薦的是活動、展覽、演唱會、市集、新聞、施工、營業異動、票價或時間表等 Google Search 查到的結果，嚴禁提供 Google 地圖連結，改用此格式：\n"
     "活動/結果名稱\n"
@@ -359,13 +365,11 @@ def get_bot_user_id() -> str | None:
 
 def get_grounding_kind(user_query: str) -> str | None:
     query = user_query.lower()
-    if any(keyword.lower() in query for keyword in RECIPE_KEYWORDS):
-        return None
     if any(keyword.lower() in query for keyword in SEARCH_KEYWORDS):
         return "search"
     if any(keyword.lower() in query for keyword in MAPS_KEYWORDS):
         return "maps"
-    return None
+    return "search"
 
 def uses_grounding(user_query: str) -> bool:
     return get_grounding_kind(user_query) is not None
@@ -562,42 +566,66 @@ def ask_gemini_foodie(prompt: str, user_query: str, location: dict | None = None
         config = build_gemini_config(user_query, location)
         response = generate_gemini_content(prompt, config, user_query)
         return format_gemini_response(response, user_query)
+    except GroundingUnavailableError:
+        logger.exception("Grounding unavailable.")
+        return "查不到可驗證的 Google 來源，請換個更明確的地點或查詢再試一次。"
     except Exception:
         logger.exception("Gemini error.")
         return "查詢失敗，請再試一次。"
 
 def generate_gemini_content(prompt: str, config, user_query: str):
-    models = [GEMINI_MODEL]
-    if GEMINI_FALLBACK_MODEL != GEMINI_MODEL:
-        models.append(GEMINI_FALLBACK_MODEL)
+    grounding_kind = get_grounding_kind(user_query)
+    models = get_candidate_models(grounding_kind)
 
     last_error = None
     for model in models:
         try:
-            return gemini_client.models.generate_content(
+            response = gemini_client.models.generate_content(
                 model=model,
                 contents=prompt,
                 config=config
             )
+            if grounding_kind and config.tools and not has_grounding_chunks(response, grounding_kind):
+                logger.warning("Gemini response missing grounding chunks. model=%s kind=%s query=%s", model, grounding_kind, user_query)
+                continue
+            return response
         except Exception as e:
             last_error = e
             logger.warning("Gemini model failed. model=%s query=%s error=%s", model, user_query, e)
 
-    if config.tools:
-        logger.warning("Retrying Gemini without grounding tools. query=%s", user_query)
-        plain_config = build_plain_gemini_config()
-        for model in models:
-            try:
-                return gemini_client.models.generate_content(
-                    model=model,
-                    contents=prompt,
-                    config=plain_config
-                )
-            except Exception as e:
-                last_error = e
-                logger.warning("Gemini plain fallback failed. model=%s query=%s error=%s", model, user_query, e)
+    if grounding_kind and config.tools:
+        raise GroundingUnavailableError(f"No verified {grounding_kind} grounding result.")
 
     raise last_error
+
+def get_candidate_models(grounding_kind: str | None) -> list[str]:
+    if grounding_kind == "maps":
+        return unique_models([GEMINI_MAPS_MODEL, GEMINI_MAPS_FALLBACK_MODEL])
+    return unique_models([GEMINI_MODEL, GEMINI_FALLBACK_MODEL])
+
+def unique_models(models: list[str]) -> list[str]:
+    unique = []
+    for model in models:
+        if model and model not in unique:
+            unique.append(model)
+    return unique
+
+def has_grounding_chunks(response, grounding_kind: str) -> bool:
+    try:
+        chunks = response.candidates[0].grounding_metadata.grounding_chunks
+    except (AttributeError, IndexError, TypeError):
+        return False
+
+    if not chunks:
+        return False
+
+    for chunk in chunks:
+        if grounding_kind == "maps" and getattr(chunk, "maps", None):
+            return True
+        if grounding_kind == "search" and getattr(chunk, "web", None):
+            return True
+
+    return False
 
 def build_gemini_config(user_query: str, location: dict | None = None):
     grounding_kind = get_grounding_kind(user_query)
@@ -605,9 +633,9 @@ def build_gemini_config(user_query: str, location: dict | None = None):
     tool_config = None
 
     if grounding_kind == "search":
-        tools.append(build_google_search_retrieval_tool())
+        tools.append(build_google_search_tool())
     elif grounding_kind == "maps":
-        tools.append(types.Tool(google_maps=types.GoogleMaps()))
+        tools.append(build_google_search_tool())
         if location:
             tool_config = types.ToolConfig(
                 retrieval_config=types.RetrievalConfig(
@@ -626,9 +654,9 @@ def build_gemini_config(user_query: str, location: dict | None = None):
         tool_config=tool_config
     )
 
-def build_google_search_retrieval_tool():
+def build_google_search_tool():
     return types.Tool(
-        google_search_retrieval=types.GoogleSearchRetrieval()
+        google_search=types.GoogleSearch()
     )
 
 def build_plain_gemini_config():
@@ -898,13 +926,19 @@ def split_message_units(text: str) -> list[str]:
         if unit.strip()
     ]
     if len(paragraph_units) > 1:
-        return paragraph_units
+        units = []
+        for paragraph_unit in paragraph_units:
+            units.extend(split_lines_into_message_units(paragraph_unit.splitlines()))
+        return units
 
-    lines = normalized_text.splitlines()
+    return split_lines_into_message_units(normalized_text.splitlines())
+
+def split_lines_into_message_units(lines: list[str]) -> list[str]:
     units = []
     current_lines = []
-    for line in lines:
-        if is_item_start_line(line) and current_lines:
+    for index, line in enumerate(lines):
+        next_line = lines[index + 1] if index + 1 < len(lines) else ""
+        if is_message_unit_start(line, next_line) and current_lines:
             units.append("\n".join(current_lines).strip())
             current_lines = [line]
         else:
@@ -915,12 +949,28 @@ def split_message_units(text: str) -> list[str]:
 
     return units
 
+def is_message_unit_start(line: str, next_line: str = "") -> bool:
+    return (
+        is_item_start_line(line)
+        or is_plain_item_title_line(line, next_line)
+        or is_source_section_start(line)
+    )
+
 def is_item_start_line(line: str) -> bool:
     stripped_line = line.strip()
     return bool(
         re.match(r"^[-*•]\s+", stripped_line)
         or re.match(r"^\d+[.、]\s+", stripped_line)
     )
+
+def is_plain_item_title_line(line: str, next_line: str) -> bool:
+    stripped_line = line.strip()
+    if not stripped_line or stripped_line.startswith("【"):
+        return False
+    return next_line.strip().startswith("【評語】")
+
+def is_source_section_start(line: str) -> bool:
+    return line.strip() in ("資料來源：", "資料來源:")
 
 def pack_message_units(units: list[str], max_length: int, max_messages: int) -> list[str]:
     messages = []
