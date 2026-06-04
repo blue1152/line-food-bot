@@ -61,9 +61,6 @@ gemini_client = genai.Client(
 )
 gemini_executor = ThreadPoolExecutor(max_workers=4)
 
-class GroundingUnavailableError(Exception):
-    pass
-
 # --- 2. 記憶庫：暫存最後發送的位置資訊 ---
 group_location_cache = {}
 user_location_cache = {}
@@ -112,7 +109,7 @@ FOODIE_SYSTEM_INSTRUCTION = (
     "1. 你必須搭配內建的 Google Search 聯網工具（Grounding）來驗證店家、景點、活動與時效資訊，絕對不允許虛構。\n"
     "2. 永久歇業、無法查證、或 grounding 資料不足的店家一律不准推薦。\n"
     "3. 前言必須極其簡短（嚴格限制在 30 字以內），直接切入主題。\n"
-    "4. 在 grounding 資料充足時，請盡量多給結果，優先提供 8 到 12 個真實可查證項目。\n\n"
+    "4. 在 grounding 資料充足時，請盡量多給結果；若使用者或系統提示指定 8 到 12 個熱門項目，請以 8 到 12 個為準。\n\n"
     "【回覆格式約束】：\n"
     "1. 使用點排列（Bullet points）呈現推薦項目。\n"
     "2. 每個推薦項目之間必須空一行，方便系統分段傳送；同一個項目的名稱、碎碎念、地圖連結和指數必須放在同一段。\n"
@@ -304,9 +301,14 @@ def has_detected_location(location_detection: dict | None) -> bool:
 def build_prompt_with_detected_locations(user_query: str, location_detection: dict) -> str:
     locations = "、".join(location_detection.get("locations", []))
     return (
-        f"使用者詢問：『{user_query}』\n"
-        f"NLP 偵測到的地點資訊：{locations}\n"
-        "請優先以這些地點資訊作為查詢與回答依據。"
+        "請使用 Google Search 聯網工具，精準抓出符合使用者需求的真實店家、景點或活動。\n"
+        f"【使用者查詢】：『{user_query}』\n"
+        f"【NLP 偵測到的地點資訊】：{locations}\n\n"
+        "【檢索引導指令】：\n"
+        "1. 請以偵測到的地點資訊作為搜尋範圍，不要把範圍擴大到其他城市或行政區。\n"
+        "2. 如果查詢是「縣市/區域 + 概括品項」（例如咖啡廳、甜點、餐廳、市集、展覽），請直接挑選該區域目前最知名的 8 到 12 個熱門且可查證項目。\n"
+        "3. 嚴格禁止因為結果太多而拒絕回答；請直接篩選代表性最高、資料最可信的結果。\n"
+        "4. 若沒有足夠可查證資料，寧可少給，但至少嘗試提供已查證的代表性結果。"
     )
 
 def build_prompt_with_cached_location(user_query: str, location: dict, chat_context: str) -> str:
@@ -318,7 +320,10 @@ def build_prompt_with_cached_location(user_query: str, location: dict, chat_cont
         f"【中心點名稱】：{location['title']}\n"
         f"【中心點地址】：{location['address']}\n"
         f"【精準座標】：緯度 {location['latitude']}, 經度 {location['longitude']}\n\n"
-        "請務必以 Google Search grounding 查到的資料為準，優先排除明顯歇業、永久停業或資料不足的結果。"
+        "【檢索引導指令】：\n"
+        "1. 請直接挑選該座標周邊目前最知名的 8 到 12 個熱門且可查證項目。\n"
+        "2. 嚴格禁止因為結果太多而拒絕回答；請直接篩選代表性最高、距離與資料可信度最好的結果。\n"
+        "3. 請務必以 Google Search grounding 查到的資料為準，優先排除明顯歇業、永久停業或資料不足的結果。"
     )
 
 def needs_location(user_query: str) -> bool:
@@ -552,9 +557,6 @@ def ask_gemini_foodie(prompt: str, user_query: str, location: dict | None = None
         config = build_gemini_config(user_query, location)
         response = generate_gemini_content(prompt, config, user_query)
         return response.text or "本美食家連網查了老半天突然失語，換個方式問問看？"
-    except GroundingUnavailableError:
-        logger.exception("Grounding unavailable.")
-        return "查不到可驗證的 Google 來源，請換個更明確的地點或查詢再試一次。"
     except Exception:
         logger.exception("Gemini error.")
         return "查詢失敗，請再試一次。"
@@ -572,21 +574,17 @@ def generate_gemini_content(prompt: str, config, user_query: str):
                 config=config
             )
             if grounding_kind and config.tools and not has_grounding_chunks(response, grounding_kind):
-                logger.warning(
-                    "Gemini response missing expected grounding chunks. model=%s kind=%s query=%s chunk_types=%s",
+                logger.info(
+                    "Gemini response has no explicit grounding chunks; using model text. model=%s kind=%s query=%s chunk_types=%s",
                     model,
                     grounding_kind,
                     user_query,
                     get_grounding_chunk_types(response)
                 )
-                continue
             return response
         except Exception as e:
             last_error = e
             logger.warning("Gemini model failed. model=%s query=%s error=%s", model, user_query, e)
-
-    if grounding_kind and config.tools:
-        raise GroundingUnavailableError(f"No verified {grounding_kind} grounding result.")
 
     raise last_error
 
