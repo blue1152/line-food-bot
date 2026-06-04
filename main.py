@@ -107,6 +107,7 @@ SEARCH_KEYWORDS = (
     "最新", "活動", "展覽", "演唱會", "市集", "施工", "營業異動", "臨時休息", "新聞", "票價", "時間表",
     "latest", "news", "event", "exhibition", "concert", "market", "construction", "schedule"
 )
+RECIPE_KEYWORDS = ("食譜", "做法", "怎麼做", "料理", "煮法", "recipe", "cook", "cooking", "how to make")
 BOT_KEYWORDS = ("@美食家", "吃什麼")
 GENERIC_PLACE_QUERY_WORDS = (
     "推薦", "找", "查", "有什麼", "哪裡", "哪家", "好吃", "好喝", "適合", "附近",
@@ -365,11 +366,13 @@ def get_bot_user_id() -> str | None:
 
 def get_grounding_kind(user_query: str) -> str | None:
     query = user_query.lower()
+    if any(keyword.lower() in query for keyword in RECIPE_KEYWORDS):
+        return None
     if any(keyword.lower() in query for keyword in SEARCH_KEYWORDS):
         return "search"
     if any(keyword.lower() in query for keyword in MAPS_KEYWORDS):
         return "maps"
-    return "search"
+    return None
 
 def uses_grounding(user_query: str) -> bool:
     return get_grounding_kind(user_query) is not None
