@@ -279,7 +279,9 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=400, detail="Invalid Signature")
 
     body_str = body.decode("utf-8")
-    wake_notice_events = mark_render_wake_events(body_str)
+    events = parse_line_webhook_events(body_str)
+    log_line_webhook_delivery(events)
+    wake_notice_events = mark_render_wake_events(events)
     for event_id, target_id in wake_notice_events:
         try:
             send_line_push(target_id, RENDER_SLEEP_NOTICE_MESSAGE)
@@ -317,7 +319,49 @@ def is_valid_line_signature(body: bytes, signature: str) -> bool:
     return hmac.compare_digest(expected_signature, signature)
 
 
-def mark_render_wake_events(body: str) -> list[tuple[str, str]]:
+def parse_line_webhook_events(body: str) -> list[dict]:
+    try:
+        events = json.loads(body).get("events", [])
+        return events if isinstance(events, list) else []
+    except Exception:
+        logger.exception("Failed to parse LINE webhook body.")
+        return []
+
+
+def log_line_webhook_delivery(events: list[dict]):
+    redelivery_count = sum(1 for event in events if is_redelivered_event(event))
+    logger.info(
+        "Received LINE webhook events. event_count=%s redelivery_count=%s",
+        len(events),
+        redelivery_count,
+    )
+
+    for event in events:
+        logger.info(
+            "LINE webhook event delivery. webhook_event_id=%s event_type=%s message_type=%s source_type=%s is_redelivery=%s",
+            get_raw_webhook_event_id(event),
+            event.get("type"),
+            (event.get("message") or {}).get("type"),
+            (event.get("source") or {}).get("type"),
+            is_redelivered_event(event),
+        )
+
+
+def get_raw_webhook_event_id(event: dict) -> str | None:
+    return event.get("webhookEventId") or event.get("webhook_event_id")
+
+
+def is_redelivered_event(event: dict) -> bool:
+    delivery_context = event.get("deliveryContext") or event.get("delivery_context")
+    if not isinstance(delivery_context, dict):
+        return False
+    return bool(
+        delivery_context.get("isRedelivery")
+        or delivery_context.get("is_redelivery")
+    )
+
+
+def mark_render_wake_events(events: list[dict]) -> list[tuple[str, str]]:
     global last_webhook_received_at
 
     now = time.time()
@@ -336,17 +380,9 @@ def mark_render_wake_events(body: str) -> list[tuple[str, str]]:
         if not is_wake_request:
             return []
 
-        try:
-            events = json.loads(body).get("events", [])
-        except Exception:
-            logger.exception(
-                "Failed to parse LINE webhook body for Render wake detection."
-            )
-            return []
-
         wake_notice_events = []
         for event in events:
-            event_id = event.get("webhookEventId") or event.get("webhook_event_id")
+            event_id = get_raw_webhook_event_id(event)
             if event_id:
                 render_wake_event_ids.add(event_id)
                 target_id = get_render_wake_notice_target(event)
