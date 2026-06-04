@@ -77,9 +77,9 @@ AI_REPLY_TIMEOUT_SECONDS = 5
 AI_TOTAL_TIMEOUT_SECONDS = 45
 RENDER_SLEEP_NOTICE_MESSAGE = "休息中, 請稍等"
 RENDER_WAKE_RETRY_DELAY_SECONDS = 60
-RENDER_WAKE_DETECTION_WINDOW_SECONDS = int(os.getenv("RENDER_WAKE_DETECTION_WINDOW_SECONDS", "120"))
-SERVICE_STARTED_AT = time.time()
-render_wake_retry_scheduled = False
+RENDER_IDLE_SECONDS = int(os.getenv("RENDER_IDLE_SECONDS", "900"))
+last_webhook_received_at = None
+render_wake_event_ids = set()
 render_wake_retry_lock = threading.Lock()
 
 LOCATION_CONTEXT_KEYWORDS = ("附近", "周邊", "這裡", "這附近", "周圍", "nearby", "near me", "around me")
@@ -147,6 +147,7 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
     
     body = await request.body()
     body_str = body.decode("utf-8")
+    mark_render_wake_events(body_str)
 
     background_tasks.add_task(handle_line_request, body_str, signature)
     return "OK"
@@ -158,6 +159,35 @@ def handle_line_request(body: str, signature: str):
         logger.warning("Invalid LINE signature.")
     except Exception:
         logger.exception("Unhandled error while handling LINE webhook.")
+
+def mark_render_wake_events(body: str):
+    global last_webhook_received_at
+
+    now = time.time()
+    with render_wake_retry_lock:
+        is_wake_request = (
+            last_webhook_received_at is None
+            or now - last_webhook_received_at >= RENDER_IDLE_SECONDS
+        )
+        last_webhook_received_at = now
+
+        if not is_wake_request:
+            return
+
+        try:
+            event_ids = [
+                event.get("webhookEventId") or event.get("webhook_event_id")
+                for event in json.loads(body).get("events", [])
+            ]
+        except Exception:
+            logger.exception("Failed to parse LINE webhook body for Render wake detection.")
+            return
+
+        for event_id in event_ids:
+            if event_id:
+                render_wake_event_ids.add(event_id)
+
+        logger.info("Marked Render wake webhook events. event_count=%s", len(event_ids))
 
 def cleanup_expired_processed_events(now: float):
     expired_event_ids = [
@@ -448,15 +478,15 @@ def log_mention_metadata(event: MessageEvent):
     logger.info("LINE mention metadata: %s", mention_data)
 
 # --- 5. 處理「位置」訊息事件 (只紀錄，不回應) ---
-def should_delay_for_render_wake() -> bool:
-    if time.time() - SERVICE_STARTED_AT > RENDER_WAKE_DETECTION_WINDOW_SECONDS:
+def should_delay_for_render_wake(event: MessageEvent) -> bool:
+    event_id = get_webhook_event_id(event)
+    if not event_id:
         return False
 
-    global render_wake_retry_scheduled
     with render_wake_retry_lock:
-        if render_wake_retry_scheduled:
+        if event_id not in render_wake_event_ids:
             return False
-        render_wake_retry_scheduled = True
+        render_wake_event_ids.discard(event_id)
         return True
 
 def retry_text_message_after_render_wake(event: MessageEvent):
@@ -510,7 +540,7 @@ def handle_text_message(event: MessageEvent, skip_duplicate_check: bool = True):
         if not is_triggered:
             return 
 
-        if should_delay_for_render_wake():
+        if should_delay_for_render_wake(event):
             send_line_reply_or_push(reply_token, RENDER_SLEEP_NOTICE_MESSAGE, target_id)
             schedule_render_wake_retry(event)
             return
@@ -531,7 +561,7 @@ def handle_text_message(event: MessageEvent, skip_duplicate_check: bool = True):
                 return
             final_prompt = build_prompt_with_detected_locations(clean_prompt, location_detection)
     else:
-        if should_delay_for_render_wake():
+        if should_delay_for_render_wake(event):
             send_line_reply_or_push(reply_token, RENDER_SLEEP_NOTICE_MESSAGE, target_id)
             schedule_render_wake_retry(event)
             return
